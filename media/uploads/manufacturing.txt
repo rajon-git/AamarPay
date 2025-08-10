@@ -1,0 +1,1152 @@
+import json
+import datetime
+import math
+import operator as py_operator
+import re
+from statistics import mean
+
+from collections import defaultdict
+from dateutil.relativedelta import relativedelta
+from itertools import groupby
+
+from odoo import api, fields, models, _
+from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.tools import float_compare, float_round, float_is_zero, format_datetime
+from odoo.tools.misc import format_date
+
+from odoo.addons.stock.models.stock_move import PROCUREMENT_PRIORITIES
+from werkzeug.urls import url_encode
+from datetime import datetime
+
+SIZE_BACK_ORDER_NUMERING = 3
+
+
+class ManufacturingOrder(models.Model):
+    _name = "manufacturing.order"
+    _description = "Manufacturing Order"
+    _check_company_auto = True
+
+    sale_order_line = fields.Many2one('sale.order.line', string='Sale Order Line', readonly=True, store=True, check_company=True, index = True)
+    oa_id = fields.Many2one('sale.order', related='sale_order_line.order_id', string='OA', readonly=True, store=True, domain="['|', ('company_id', '=', False), ('company_id', '=', company_id)]", check_company=True, index = True)
+    company_id = fields.Many2one('res.company', string='Company', readonly=True, store=True, index=True, default=lambda self: self.env.company.id, check_company=True)
+    partner_id = fields.Many2one('res.partner', related='oa_id.partner_id', string='Customer', readonly=True, index = True)
+    buyer_name = fields.Char(string='Buyer', readonly=True, index = True)
+    buyer_id = fields.Many2one('res.partner', related='oa_id.buyer_name', string='Buyer Name', readonly=True, index = True)
+    buying_house = fields.Many2one('res.partner', related='oa_id.buying_house', string='Buyeing House', store=True, index = True)
+    payment_term = fields.Many2one('account.payment.term', related='oa_id.payment_term_id', string='Payment Term', readonly=True, index = True)
+    date_order = fields.Datetime(string='Order Date', related='oa_id.date_order', readonly=True)
+    validity_date = fields.Date(string='Expiration', related='oa_id.validity_date', readonly=True)
+
+    lead_time_c = fields.Integer(string='Lead', readonly=True, index = True)#compute='get_leadtime',
+    
+    lead_time = fields.Integer(string='Lead Time', readonly=True, store=True, group_operator='avg', index = True)
+    currency_id = fields.Many2one('res.currency', string='Currency',
+        related='sale_order_line.currency_id', store=True, readonly=True)    
+    product_id = fields.Many2one(
+        'product.product', related='sale_order_line.product_id', string='Product Id', check_company=True, index = True)
+    product_template_id = fields.Many2one(
+        'product.template', string='Product', index = True,
+        related="product_id.product_tmpl_id", domain=[('sale_ok', '=', True)])
+    fg_categ_type = fields.Char(related='product_template_id.fg_categ_type.name', string='Item', store=True, index = True)
+    fg_categ_group = fields.Char(related='product_template_id.fg_categ_type.parent_type', string='Item Group', store=True, index = True)
+    st_lead_time = fields.Integer(related='product_template_id.sale_delay', string='Standard Lead', store=True)
+    product_uom = fields.Many2one('uom.uom', string='Unit', related='product_template_id.uom_id')
+    product_uom_qty = fields.Float(string='Quantity', related='sale_order_line.product_uom_qty', digits='Product Unit of Measure', readonly=True, store=True)
+    price_unit = fields.Float('Unit Price', related='sale_order_line.price_unit', digits='Product Price', readonly=True, store=True)
+    final_price = fields.Monetary('Final Price', currency_field='currency_id', related='sale_order_line.price_reduce_taxinc', readonly=True, store=True)
+    done_qty = fields.Float(string='Done Qty', digits='Product Unit of Measure', readonly=False, store=True)
+    balance_qty = fields.Float(string='Balance', digits='Product Unit of Measure', compute='_balance_qty', readonly=True, group_operator="sum", store=True)#compute='_balance_qty',
+    # RM = 
+
+    @api.depends('product_uom_qty', 'done_qty')
+    def _balance_qty(self):
+        # manufac_ids = self.env["manufacturing.order"].search([('oa_id','=',self.oa_id.id)])
+        # raise UserError(f"Manufacturing IDs: {manufac_ids.ids}")
+        for s in self:
+            s.balance_qty = s.product_uom_qty - s.done_qty
+            packing = self.env["operation.details"].search([('oa_id','=',s.oa_id.id),('next_operation','=','FG Packing'),('state','!=','closed')])
+            # raise UserError ((s.done_qty,sum(packing.mapped('qty'))))
+            oa_to_bal = s.oa_total_qty-sum(packing.mapped('qty'))
+            if oa_to_bal < 0:
+                raise UserError(('There has a problem in Balance, please contact with Odoo (Rf-2)'))   
+            s.oa_total_balance = oa_to_bal
+
+    @api.depends('tape_con', 'dyeing_plan_qty')
+    def _dy_plane_due(self):
+        for s in self:
+            s.dyeing_plan_due = s.tape_con - s.dyeing_plan_qty
+
+    tape = fields.Many2one('product.product', string='Tape')
+    tape_stock = fields.Float(string='Tape Stock', related='tape.qty_available', store=True)
+    
+    slider = fields.Many2one('product.product', string='RM Slider')
+    slider_stock = fields.Float(string='Slider Stock', related='slider.qty_available', store=True)
+    
+    wire = fields.Many2one('product.product', string='Wire')
+    wire_stock = fields.Float(string='Wire Stock', related='wire.qty_available', store=True)
+    
+    top = fields.Many2one('product.product', string='Top')
+    top_stock = fields.Float(string='Top Stock', related='top.qty_available', store=True)
+    
+    bottom = fields.Many2one('product.product', string='Bottom')
+    bottom_stock = fields.Float(string='Bottom Stock', related='bottom.qty_available', store=True)
+    
+    pinbox = fields.Many2one('product.product', string='Pinbox')
+    pinbox_stock = fields.Float(string='Pinbox Stock', related='pinbox.qty_available', store=True)
+    
+    resign = fields.Many2one('product.product', string='Resign')
+    resign_stock = fields.Float(string='Resign Stock', related='resign.qty_available', store=True)
+
+    
+    topbottom = fields.Char(string='Top/Bottom', store=True, readonly=True)
+    slidercodesfg = fields.Char(string='Slider', store=True, readonly=True)
+    finish = fields.Char(string='Finish', store=True, readonly=True)
+    shade = fields.Char(string='Shade', store=True, readonly=True)
+    shade_ref = fields.Char(string='Shade Ref.', store=True, readonly=True)
+    
+    sizein = fields.Char(string='Size (Inch)', store=True, readonly=True)
+    sizecm = fields.Char(string='Size (CM)', store=True, readonly=True)
+    sizemm = fields.Char(string='Size (MM)', store=True, readonly=True)
+    
+    dyedtape = fields.Char(string='Dyed Tape', store=True, readonly=True)
+    ptopfinish = fields.Char(string='Top Finish', store=True, readonly=True)
+    
+    numberoftop = fields.Char(string='N.Top', store=True, readonly=True)
+    
+    pbotomfinish = fields.Char(string='Bottom Finish', store=True)
+    ppinboxfinish = fields.Char(string='Pin-Box Finish', store=True)
+    dippingfinish = fields.Char(string='Dipping Finish', store=True)
+    gap = fields.Char(string='Gap', store=True)
+
+    logo = fields.Text(string='Logo', store=True)
+    logoref = fields.Text(string='Logo Ref', store=True)
+    logo_type = fields.Text(string='Logo Type', store=True)
+    style = fields.Text(string='Style', store=True)
+    gmt = fields.Text(string='Gmt', store=True)
+    shapefin = fields.Text(string='Shape Finish', store=True)
+    bcdpart = fields.Text(string='BCD Part Material Type / Size', store=True)
+    b_part = fields.Text(string='B Part', store=True)
+    c_part = fields.Text(string='C Part', store=True)
+    d_part = fields.Text(string='D Part', store=True)
+    finish_ref = fields.Text(string='Finish Ref', store=True)
+    product_code = fields.Text(string='Product Code', store=True)
+    shape = fields.Text(string='Shape', store=True)
+    nailmat = fields.Text(string='Nail Material / Type / Shape / Size', store=True)
+    nailcap = fields.Text(string='Nail Cap Logo', store=True)
+    fnamebcd = fields.Text(string='Finish Name ( BCD/NAIL/ NAIL CAP)', store=True)
+    nu1washer = fields.Text(string='1 NO. Washer Material & Size', store=True)
+    nu2washer = fields.Text(string='2 NO. Washer Material & Size', store=True)
+    back_part = fields.Text(string='Back Part', store=True)
+    # mold_set
+    # weight_per_gross
+    # color
+    # dimension
+    tape_con = fields.Float('Tape C.', related='sale_order_line.tape_con', readonly=True, digits='Unit Price', store=True)
+    slider_con = fields.Float('Slider C.', related='sale_order_line.slider_con', readonly=True, digits='Unit Price', store=True)
+    
+    topwire_con = fields.Float('Topwire C.', related='sale_order_line.topwire_con', readonly=True, digits='Unit Price')
+    botomwire_con = fields.Float('Botomwire C.', related='sale_order_line.botomwire_con', readonly=True, digits='Unit Price')
+    tbwire_con = fields.Float('TBwire C.', related='sale_order_line.tbwire_con', readonly=True, digits='Unit Price')
+    wire_con = fields.Float('Wire C.', related='sale_order_line.wire_con', readonly=True, digits='Unit Price')
+    pinbox_con = fields.Float('Pinbox C.', related='sale_order_line.pinbox_con', readonly=True, digits='Unit Price')
+    shadewise_tape = fields.Float('Shadwise Tape', related='sale_order_line.shadewise_tape', readonly=True, digits='Unit Price')
+    
+    dyeing_plan = fields.Datetime(string='Dye Plan', readonly=False)
+    dyeing_plan_end = fields.Datetime(string='Dye Plan End', readonly=False)
+    dyeing_plan_qty = fields.Float(string='Dye Plan Qty', readonly=False, store=True)
+    dy_rec_plan_qty = fields.Float(string='Dye Last Plan', readonly=False, default=0.0)
+            
+    dyeing_plan_due = fields.Float(string='Dye Plan Due', digits='Product Unit of Measure', compute='_dy_plane_due', readonly=True, group_operator="sum", store=True)#compute='_dy_plane_due',
+    
+    dyeing_output = fields.Float(string='Dye Output', readonly=False, default=0.0)
+    dyeing_qc_pass = fields.Float(string='Dye QC Pass', readonly=False, default=0.0)
+
+    plating_plan = fields.Datetime(string='Plat/Paint Start', readonly=False)
+    plating_plan_end = fields.Datetime(string='Plat/Paint End', readonly=False)
+    plating_plan_qty = fields.Float(string='Plat/Paint Plan Qty', readonly=False)
+    pl_rec_plan_qty = fields.Float(string='Plat/Paint Rceplan Qty', readonly=False, default=0.0)
+    plating_output = fields.Float(string='Plat/Paint Output', readonly=False)
+    #plating_qc_pass = fields.Float(string='Plating QC Pass', readonly=False)
+
+    top_plat_plan = fields.Datetime(string='Top Plat/Paint Start', readonly=False)
+    top_plat_plan_end = fields.Datetime(string='Top Plat/Paint End', readonly=False)
+    top_plat_plan_qty = fields.Float(string='Top Plat/Paint Plan Qty', readonly=False)
+    tpl_rec_plan_qty = fields.Float(string='Top Plat/Paint Recplan Qty', readonly=False, default=0.0)
+    top_plat_output = fields.Float(string='Top Plat/Paint Output', readonly=False)
+    #top_plat_qc_pass = fields.Float(string='Plating QC Pass', readonly=False)
+
+    bot_plat_plan = fields.Datetime(string='Btm Plat/Paint Start', readonly=False)
+    bot_plat_plan_end = fields.Datetime(string='Btm Plat/Paint End', readonly=False)
+    bot_plat_plan_qty = fields.Float(string='Btm Plat/Paint Plan Qty', readonly=False)
+    bpl_rec_plan_qty = fields.Float(string='Btm Plat/Paint Recplan Qty', readonly=False, default=0.0)
+    bot_plat_output = fields.Float(string='Btm Plat/Paint Output', readonly=False)
+    #bot_plat_qc_pass = fields.Float(string='Plating QC Pass', readonly=False)    
+
+    pin_plat_plan = fields.Datetime(string='Pbox Plat/Paint Start', readonly=False)
+    pin_plat_plan_end = fields.Datetime(string='Pbox Plat/Paint End', readonly=False)
+    pin_plat_plan_qty = fields.Float(string='Pbox Plat/Paint Plan Qty', readonly=False)
+    ppl_rec_plan_qty = fields.Float(string='Pbox Plat/Paint Recplan Qty', readonly=False, default=0.0)
+    pin_plat_output = fields.Float(string='Pbox Plat/Paint Output', readonly=False)
+    #pin_plat_qc_pass = fields.Float(string='Plating QC Pass', readonly=False)    
+
+    sli_asmbl_plan = fields.Datetime(string='Slider Asmbl Plan Start', readonly=False)
+    sli_asmbl_plan_end = fields.Datetime(string='Slider Asmbl Plan End', readonly=False)
+    sli_asmbl_plan_qty = fields.Float(string='Slider Asmbl Plan Qty', readonly=False)
+    sass_rec_plan_qty = fields.Float(string='Slider Asmbl Rceplan Qty', readonly=False, default=0.0)
+    sli_asmbl_output = fields.Float(string='Slider Asmbl Output', readonly=False)
+
+    # painting_done = fields.Float(string='Painting Output', readonly=False)
+    # p_plan = fields.Datetime(string='Slider Asmbl Plan Start', readonly=False)
+    # sli_asmbl_plan_end = fields.Datetime(string='Slider Asmbl Plan End', readonly=False)
+    # sli_asmbl_plan_qty = fields.Float(string='Slider Asmbl Plan Qty', readonly=False)
+    # sass_rec_plan_qty = fields.Float(string='Plating Replan Qty', readonly=False, default=0.0)
+    # sli_asmbl_output = fields.Float(string='Plating Output', readonly=False)
+    
+    # chain_making_plan = fields.Float(string='CM Plan', readonly=False)
+    chain_making_done = fields.Float(string='CM Output', readonly=False)
+    diping_done = fields.Float(string='Dipping Output', readonly=False)
+    assembly_done = fields.Float(string='Assembly Output', readonly=False)
+    packing_done = fields.Float(string='Packing Output', readonly=False)
+    
+    oa_total_qty = fields.Float(string='OA Total Qty', readonly=True)
+    oa_total_balance = fields.Float(string='OA Balance', readonly=True, store=True)#, compute='_oa_balance'
+    remarks = fields.Text(string='Remarks', readonly=True, store=True)
+    num_of_lots = fields.Integer(string='N. of Lots', readonly=True)#compute='get_lots'
+    plan_ids = fields.Char(string='Plan Ids', store=True)
+    state = fields.Selection([
+        ('waiting', 'Waiting'),
+        ('partial', 'Partial'),
+        ('done', 'Done'),
+        ('hold', 'Hold'),
+        ('cancel', 'Cancelled'),
+        ('closed', 'Closed')],
+        string='State')
+    revision_no = fields.Char(string='Revision No', store=True)
+    closing_date = fields.Datetime(string='Closing Date', readonly=False)
+    sale_line_of_top = fields.Integer(string='Sale Line of Top', store=True, readonly=True)
+    exp_close_date = fields.Date(string='Expected Closing Date')
+    line_closing_date = fields.Datetime(string='Line Closing Date', readonly=False)
+    # @api.depends('date_order') #,'closing_date'
+    @api.depends('date_order', 'closing_date', 'product_uom_qty', 'done_qty')
+    def get_leadtime(self):
+        for s in self:
+            if s.date_order:
+                done_date = None
+                if s.closing_date:
+                    done_date = s.closing_date.date()
+                packing = self.env["operation.details"].search([('next_operation', '=', 'FG Packing'), ('mrp_line', '=', s.id), ('oa_id', '!=', False)])
+                if packing:
+                    qty = sum(packing.mapped('qty'))
+                    if qty >= s.product_uom_qty:
+                        done_date = max(packing.mapped('action_date')).date()
+                if done_date == None:
+                    done_date = datetime.now().date()
+                s.lead_time_c = s.lead_time = (done_date - s.date_order.date()).days
+            else:
+                s.lead_time_c = s.lead_time = 0
+
+    def update_leadtime_sechedule_action(self):
+        m_orders = self.env["manufacturing.order"].search([('oa_total_balance', '>', 0), ('oa_id', '!=', False), ('state', 'not in', ('closed', 'cancel', 'hold'))])
+        for s in m_orders:
+            if s.date_order:
+                done_date = None
+                if s.closing_date:
+                    done_date = s.closing_date.date()
+                packing = self.env["operation.details"].search([('next_operation', '=', 'FG Packing'), ('mrp_line', '=', s.id), ('oa_id', '!=', False)])
+                if packing:
+                    qty = sum(packing.mapped('qty'))
+                    if qty >= s.product_uom_qty:
+                        done_date = max(packing.mapped('action_date')).date()
+                if done_date == None:
+                    done_date = datetime.now().date()
+                s.lead_time_c = s.lead_time = (done_date - s.date_order.date()).days
+            else:
+                s.lead_time_c = s.lead_time = 0
+
+    
+
+    def calculate_leadtime(self):
+        manufac_ids = self.env["manufacturing.order"].search([('oa_total_balance', '>', 0), ('oa_id', '!=', False), ('state', 'not in', ('closed', 'cancel', 'hold'))])
+        for s in manufac_ids:
+            if s.date_order:
+                if s.closing_date:
+                    s.lead_time_c = s.lead_time = (s.closing_date.date() - s.date_order.date()).days
+                else:
+                    s.lead_time_c = s.lead_time = (datetime.now().date() - s.date_order.date()).days
+            else:
+                s.lead_time_c = s.lead_time = 0
+
+    def execute_leadtime(self):
+        s = self
+        if s.date_order:
+            done_date = None
+            if s.closing_date:
+                done_date = s.closing_date.date()
+            packing = self.env["operation.details"].search([('next_operation', '=', 'FG Packing'), ('mrp_line', '=', s.id), ('oa_id', '!=', False)])
+            if packing:
+                qty = sum(packing.mapped('qty'))
+                if qty >= s.product_uom_qty:
+                    done_date = max(packing.mapped('action_date')).date()
+            if done_date == None:
+                # raise UserError((done_date,s.id))
+                done_date = datetime.now().date()
+            s.lead_time_c = s.lead_time = (done_date - s.date_order.date()).days
+        else:
+            s.lead_time_c = s.lead_time = 0
+
+
+    @api.onchange('done_qty')
+    def _done_qty(self):
+        for s in self:
+            if s.product_uom_qty <= s.done_qty:
+                s.state = 'done'
+            elif s.done_qty == 0:
+                s.state = 'waiting'
+            else:
+                s.state = 'partial'
+                
+    @api.onchange('packing_done')
+    def _packing_output(self):
+        for out in self:
+            done_qty = out.done_qty + out.packing_done
+            out.done_qty = done_qty
+            manufac_ids = self.env["manufacturing.order"].search([('oa_id','=',out.oa_id.id)])
+            oa_bal = out.oa_total_balance - out.packing_done
+            if oa_bal < 0:
+                raise UserError(('There has a problem in Balance, please contact with Odoo (Rf-1)'))            
+            manu = manufac_ids.update({'oa_total_balance':oa_bal})
+            
+    def button_createlot(self):
+        self.ensure_one()
+        self._check_company()
+        action = self.env["ir.actions.actions"]._for_xml_id("taps_manufacturing.action_mrp_lot")
+        return action
+    
+    def action_view_lots(self):
+        """ This function returns an action that display existing picking orders of given purchase order ids. When only one found, show the picking immediately.
+        """
+        result = self.env["ir.actions.actions"]._for_xml_id('taps_manufacturing.action_operation_details')
+        # override the context to get rid of the default filtering on operation type
+        result['context'] = {'mrp_line': self.id, 'operation_of': 'lot'}
+        lots_ = self.env['operation.details'].search([('mrp_line', '=', self.id),('operation_of', '=', 'lot')])
+        lot_ids = lots_.mapped('id')
+        #raise UserError((lot_ids))
+        # choose the view_mode accordingly
+        result['domain'] = "[('id','in',%s)]" % (lot_ids)
+        return result
+        
+    def get_lots(self):
+        for s in self:
+            count_lots = self.env['operation.details'].search_count([('mrp_line', '=', s.id),('operation_of', '=', 'lot')])
+            s.num_of_lots = count_lots
+            #s.lot_ids = count_lots.mapped('id')    
+
+    # def _oa_balance(self):
+    #     for s in self:
+    #         mr = self.env["manufacturing.order"].search([('oa_id','=',s.oa_id.id)])
+    #         s.oa_total_balance = s.oa_total_qty-sum(mr.mapped('done_qty'))
+
+    def button_plan(self):
+        self._check_company()
+        items = self.mapped('fg_categ_type')
+        items = ','.join([str(i) for i in sorted(items)])
+        items = items.replace('OE','')
+        items = items.replace('CE','')
+        # items = list(items)
+        items = [str(i) for i in sorted(items.split(','))]
+        items = list(set(items))
+        # raise UserError(items)
+        if len(items) > 1:
+            raise UserError(_("Cannot plan with two items togather."))
+        action = self.env["ir.actions.actions"]._for_xml_id("taps_manufacturing.action_mrp_plan")
+        action["domain"] = [('default_id','in',self.mapped('id'))]
+        #action["context"] = {"default_item_qty": 20,"default_material_qty": 12}
+        return action
+    
+    def _ids2str(self,field_name):
+        field_data = getattr(self, field_name)
+        if field_name == "ids":
+            return ','.join([str(i) for i in sorted(field_data)])
+        else:
+            return ','.join([str(i.id) for i in sorted(field_data)])
+            
+    def _get_field(self,field_name):
+        field_data = getattr(self, field_name)
+        #raise UserError((field_name))
+        return field_data
+
+
+    def set_plan(self,mo_ids,plan_for_id,plan_for_sec,material,plan_start,plan_end,plan_qty,machine_line,product_id=None):
+        req_id = None
+        if product_id:
+            # raise UserError((plan_for_sec.id,product_id.id))
+            req_id = self.env["operation.details"].set_requisition(self.company_id.id, 'manufacturing.order',mo_ids,plan_for_sec.id,product_id,None,plan_qty)
+        plan_for = plan_for_sec.name
+        production = self.env["manufacturing.order"].browse(mo_ids)
+        m_qty = 0.00
+        rest_pl_q = plan_qty
+        # p_len = len(production)
+        # dist_qty = plan_qty / p_len
+        # raise UserError((plan_for_id,plan_for,material))
+        addition = 0.00
+        machine_line = machine_line.filtered(lambda p: p.material_qty > 0)
+        
+        max_plan_id = self.env['operation.details'].search([('plan_id','!=',False)]).sorted(key=lambda pr: pr.plan_id, reverse=True)[:1].mapped('plan_id')
+        max_plan_id = sum(max_plan_id)
+        max_plan_id += 1
+        shades = production.mapped('shade')
+        # for sh in shades: pro = produc.filtered(lambda p: p.shade == sh.shade)
+        if material == 'tape':
+            for mc in machine_line:
+                if mc.material_qty > 0:
+                    rest_pl_q = mc.material_qty
+                    # raise UserError((mc.sa_oa_ref))
+                    pro = production.filtered(lambda p: p.oa_id.id == mc.oa_id.id).sorted(key=lambda sol: sol.balance_qty)
+                    for p in pro:
+                        if p.tape_con <= rest_pl_q:
+                            m_qty = p.tape_con
+                            rest_pl_q = rest_pl_q - p.tape_con
+                        else:
+                            m_qty = rest_pl_q
+                            rest_pl_q = 0.00
+                        re_pqty = m_qty 
+                        m_qty += p.dyeing_plan_qty
+                        p_ids = max_plan_id
+                        if p.plan_ids:
+                            p_ids = p.plan_ids + ',' + str(max_plan_id)
+                        p.update({'dyeing_plan':plan_start,'dyeing_plan_qty':m_qty,
+                                  'dy_rec_plan_qty':re_pqty,'plan_ids':p_ids})
+                        
+        
+        for p in production:
+            p_ids = max_plan_id
+            if p.plan_ids:
+                p_ids = p.plan_ids + ',' + str(max_plan_id)
+            if material == 'slider':
+                if p.slider_con <= rest_pl_q:
+                    m_qty = p.slider_con
+                    rest_pl_q = rest_pl_q - p.slider_con
+                else:
+                    m_qty = rest_pl_q
+                    rest_pl_q = 0.00
+                re_pqty = m_qty
+              
+                if plan_for == 'Slider Assembly':
+                    m_qty += p.sli_asmbl_plan_qty
+                    p.update({'sli_asmbl_plan':plan_start,'sli_asmbl_plan_qty':m_qty,'sass_rec_plan_qty':re_pqty,'plan_ids':p_ids})
+                else:
+                    m_qty += p.plating_plan_qty
+                    p.update({'plating_plan':plan_start,'plating_plan_qty':m_qty,'pl_rec_plan_qty':re_pqty,'plan_ids':p_ids})
+            
+            elif material == 'top':
+                if p.topwire_con <= rest_pl_q:
+                    m_qty = p.topwire_con
+                    rest_pl_q = rest_pl_q - p.topwire_con
+                else:
+                    m_qty = rest_pl_q
+                    rest_pl_q = 0.00
+                re_pqty = m_qty 
+                m_qty += p.top_plat_plan_qty
+                p.update({'top_plat_plan':plan_start,'top_plat_plan_qty':m_qty,
+                         'tpl_rec_plan_qty':re_pqty,'plan_ids':p_ids})
+
+            elif material == 'bottom':
+                if p.botomwire_con <= rest_pl_q:
+                    m_qty = p.botomwire_con
+                    rest_pl_q = rest_pl_q - p.botomwire_con
+                else:
+                    m_qty = rest_pl_q
+                    rest_pl_q = 0.00
+                re_pqty = m_qty 
+                m_qty += p.bot_plat_plan_qty
+                p.update({'bot_plat_plan':plan_start,'bot_plat_plan_qty':m_qty,
+                         'bpl_rec_plan_qty':re_pqty,'plan_ids':p_ids})
+
+            elif material == 'pinbox':
+                if p.pinbox_con <= rest_pl_q:
+                    m_qty = p.pinbox_con
+                    rest_pl_q = rest_pl_q - p.pinbox_con
+                else:
+                    m_qty = rest_pl_q
+                    rest_pl_q = 0.00
+                re_pqty = m_qty 
+                m_qty += p.bot_plat_plan_qty
+                p.update({'pin_plat_plan':plan_start,'pin_plat_plan_qty':m_qty,
+                         'ppl_rec_plan_qty':re_pqty,'plan_ids':p_ids})            
+            # if plan_for == 'dyeing':
+            #     if p.tape_con < dist_qty + addition:
+            #         m_qty = p.tape_con
+            #         addition = (dist_qty + addition) - p.tape_con
+            #     else:
+            #         m_qty = dist_qty + addition
+            #         addition = 0.00
+            #     re_pqty = m_qty 
+            #     m_qty += p.dyeing_plan_qty
+            #     p.write({'dyeing_plan':plan_start,'dyeing_plan_end':plan_end,'dyeing_plan_qty':m_qty,
+            #              'dy_rec_plan_qty':re_pqty})
+                
+    
+    # ptopfinish pbotomfinish ppinboxfinish
+        if material == 'tape':
+            query = """ select oa_id,shade,'' as finish,'' as material,sum(dy_rec_plan_qty) as qty from manufacturing_order where id in %s and 1=%s group by oa_id,shade """
+        if material == 'slider':
+            query = """ select oa_id,shade as shade, finish,slidercodesfg as material,sum(pl_rec_plan_qty) as qty from manufacturing_order where id in %s and 1=%s group by oa_id,shade,finish,slidercodesfg """
+        if material == 'top':
+            query = """ select oa_id, shade as shade, finish,ptopfinish as material,sum(pl_rec_plan_qty) as qty from manufacturing_order where id in %s and 1=%s group by oa_id,shade,finish,ptopfinish """
+        if material == 'bottom':
+            query = """ select oa_id,shade as shade, finish,pbotomfinish as material,sum(pl_rec_plan_qty) as qty from manufacturing_order where id in %s and 1=%s group by oa_id,shade,finish,pbotomfinish """
+        if material == 'pinbox':
+            query = """ select oa_id,shade as shade, finish,ppinboxfinish as material,sum(pl_rec_plan_qty) as qty from manufacturing_order where id in %s and 1=%s group by oa_id,shade,finish,ppinboxfinish """            
+            
+        cr = self._cr
+        cursor = self.env.cr
+        cr.execute(query,[tuple(mo_ids),1])
+        plan = cursor.fetchall()
+        #raise UserError((plan))
+        if machine_line:
+            machines = machine_line.mapped('machine_no')
+            qty = 0.0
+            ope_ids = []
+            for mc in machines:
+                mc_oa_ids = machine_line.filtered(lambda sol: sol.machine_no.id == mc.id)
+                # oa_ids = sorted(mc_oa_ids.mapped('oa_id'), key=lambda rec: rec.material_qty or 0)
+                oa_ids = mc_oa_ids.sorted(key=lambda r: r.material_qty or 0).mapped('oa_id')
+                # oa_ids = mc_oa_ids.mapped('oa_id')
+                # mq = sum(mc_oa_ids.mapped('material_qty'))
+                # a_lots = math.ceil(mq/mc.capacity)
+                # raise UserError((lots))
+                # lots = mc.no_of_busket * a_lots
+                # raise UserError((oa_ids[0].buyer_name,mc.buyer_name))
+                # if oa_ids[0].buyer_name.id == mc.buyer_name.id:
+                #     lots = mc.buyer_busket * a_lots
+                
+                # q_per_basket = mq/lots
+                # qty = round((rest_plq / len(oa_ids)),2)
+                # raise UserError((rest_plq,qty))
+                # for lts in range(lots):
+                
+                # basket_n = 0
+                # # basket_n = 0
+                # baskt_cap = mq / lots
+                
+                # for lts in range(lots):
+                #     basket_n += 1
+                #     basket = f'B-{max_plan_id}-{basket_n:04d}'
+                #     remaining_basket_capacity = baskt_cap
+                basket = None
+                for oa in oa_ids:
+                    # Get total qty available for this OA
+                    oa_plan = mc_oa_ids.filtered(lambda sol: sol.oa_id.id == oa.id)
+                    oa_qty_total = sum(oa_plan.mapped('material_qty'))
+            
+                    # Skip OA if nothing to plan
+                    if oa_qty_total <= 0:
+                        continue
+            
+                    # Get sorted production lines under this OA
+                    p_q = production.filtered(lambda sol: sol.oa_id.id == oa.id and sol.balance_qty > 0).sorted(key=lambda sol: sol.balance_qty)
+                    oa_remaining_qty = oa_qty_total
+            
+                    for l in p_q:
+                        if oa_remaining_qty <= 0:
+                            break  # move to next OA or basket
+            
+                        # Already planned qty for this line under this plan
+                        pre_planned = sum(self.env["operation.details"].search([
+                            ('next_operation', '=', 'Dyeing Qc'),
+                            ('mrp_lines', '=', l.id),
+                            ('plan_id', '=', max_plan_id)
+                        ]).mapped('qty'))
+            
+                        line_remaining = l.dy_rec_plan_qty - pre_planned
+            
+                        if line_remaining <= 0:
+                            continue
+            
+                        # Final qty to plan for this line
+                        set_qty = min(line_remaining, oa_remaining_qty)
+                        
+                        # raise UserError((oa_qty_total,oa_remaining_qty,set_qty,oa.name,l.id,l.tape_con,l.product_uom_qty))
+            
+                        if set_qty <= 0:
+                            continue
+            
+                        # Decrease from OA and basket level
+                        # remaining_basket_capacity -= set_qty
+                        oa_remaining_qty -= set_qty
+                        
+                        pcs_per_kg = l.product_uom_qty / l.tape_con
+                        item_qty = min(l.product_uom_qty, round((pcs_per_kg * set_qty),0))
+                        # raise UserError((item_qty,set_qty,l.product_uom_qty,l.tape_con))
+                        # Create operation.details
+                        l_capa = l.product_template_id.qty_per_lot 
+                        if not l_capa or l_capa == 0:
+                            raise UserError(('Set Capacity of Lot'))
+                        lots = 1
+                        if item_qty > l_capa:
+                            lots = math.ceil(item_qty/l_capa)
+
+                        rem_item_qty = item_qty
+                        for l_q in range(lots):
+                            current_qty  = l_capa
+                            if l_q == lots - 1:
+                                current_qty  = rem_item_qty
+                            
+                            rem_item_qty -= current_qty 
+                            current_tape = current_qty / pcs_per_kg
+                            set_qty -= current_tape
+                            self.env['operation.details'].create({
+                                'mrp_lines': l.id,
+                                'sale_lines': l._ids2str('sale_order_line'),
+                                'mrp_line': l.id,
+                                'sale_order_line': l.sale_order_line.id,
+                                'oa_id': oa.id,
+                                'buyer_name': l.buyer_name,
+                                'product_id': l.product_id.id,
+                                'product_template_id': l.product_template_id.id,
+                                'action_date': plan_start,
+                                'shade': l.shade,
+                                'finish': None,
+                                'shade_ref': l.shade_ref,
+                                'sizein': l.sizein,
+                                'sizecm': l.sizecm,
+                                'slidercodesfg': l.slidercodesfg,
+                                'top': l.top,
+                                'bottom': l.bottom,
+                                'pinbox': l.pinbox,
+                                'operation_of': 'qc',
+                                'work_center': plan_for_id,
+                                'operation_by': 'Dyeing',
+                                'based_on': mc_oa_ids[0].machine_no.name,
+                                'next_operation': 'Dyeing Qc',
+                                'machine_no': mc_oa_ids[0].machine_no.id,
+                                'capacity': mc_oa_ids[0].machine_no.capacity,
+                                'qty': current_tape,
+                                'item_qty': current_qty,
+                                'balance_qty': set_qty,
+                                'price_unit': l.price_unit,
+                                'final_price': l.final_price,
+                                'state': 'waiting',
+                                'basket_no': basket,
+                                'plan_id': max_plan_id,
+                                'plan_remarks': mc_oa_ids[0].remarks,
+                                'mr_req': req_id
+                            })
+                        # ope_ids.append(mrp_.id)
+            
+                    # If the basket is already filled, move to the next one
+                    # if remaining_basket_capacity <= 0:
+                    #     break
+                
+                                            # ope_ids.append(mrp_.id)
+                                            # op_ids = ','.join([str(i) for i in sorted(ope_ids)])
+                                            # op_ids = [int(i) for i in sorted(op_ids.split(','))]
+                                            # planned_ope = self.env["operation.details"].browse(op_ids)
+                                            # for op in planned_ope:
+                                            #     oper = op.write({'uotput_qty':op.qty})
+                                            #     op._output()
+                                # rest_q = rest_q - m.machine_no.capacity
+        else:
+            for p in plan:
+                qty = 0.0
+                mrp_lines = None
+                sale_lines = None
+                next_operation = None
+                mrp_line = sal_line = None
+                
+                if plan_for == 'Plating':
+                    next_operation = 'Plating Output'
+                if plan_for == 'Slider Assembly':
+                    next_operation = 'Slider Assembly Output'
+                if plan_for == 'Painting':
+                    next_operation = 'Painting Output'
+                slider = top = bottom = pinbox = None
+                p_q = production.filtered(lambda sol: sol.oa_id.id == p[0] and sol.finish == p[2])
+                if material == 'slider':
+                    p_q = production.filtered(lambda sol: sol.oa_id.id == p[0] and sol.finish == p[2] and sol.slidercodesfg == p[3])
+                    slider = p[3]
+                    mrp_lines = p_q._ids2str('ids')
+                    sale_lines = p_q._ids2str('sale_order_line')#.mapped('sale_order_line')
+                    if len(p_q) == 1:
+                        mrp_line = p_q.id
+                        sal_line = p_q.sale_order_line.id
+                        
+                    if plan_for == 'Slider Assembly':
+                        qty = round(sum(p_q.mapped('sass_rec_plan_qty')),0)
+                    else:
+                        qty = round(sum(p_q.mapped('pl_rec_plan_qty')),0)
+                        
+                elif material == 'top': #ptopfinish pbotomfinish ppinboxfinish
+                    p_q = production.filtered(lambda sol: sol.oa_id.id == p[0] and sol.finish == p[2] and sol.ptopfinish == p[3])
+                    top = p[3]
+                    mrp_lines = p_q._ids2str('ids')
+                    sale_lines = p_q._ids2str('sale_order_line')
+                    
+                    if len(p_q) == 1:
+                        mrp_line = p_q.id
+                        sal_line = p_q.sale_order_line.id
+                    qty = sum(p_q.mapped('tpl_rec_plan_qty'))
+                elif material == 'bottom':
+                    p_q = production.filtered(lambda sol: sol.oa_id.id == p[0] and sol.finish == p[2] and sol.pbotomfinish == p[3])
+                    bottom = p[3]
+                    mrp_lines = p_q._ids2str('ids')
+                    sale_lines = p_q._ids2str('sale_order_line')
+                    if len(p_q) == 1:
+                        mrp_line = p_q.id
+                        sal_line = p_q.sale_order_line.id
+                    qty = sum(p_q.mapped('bpl_rec_plan_qty'))
+                elif material == 'pinbox':
+                    p_q = production.filtered(lambda sol: sol.oa_id.id == p[0] and sol.finish == p[2] and sol.ppinboxfinish == p[3])
+                    pinbox = p[3]
+                    mrp_lines = p_q._ids2str('ids')
+                    sale_lines = p_q._ids2str('sale_order_line')
+                    if len(p_q) == 1:
+                        mrp_line = p_q.id
+                        sal_line = p_q.sale_order_line.id
+                    qty = sum(p_q.mapped('ppl_rec_plan_qty'))
+                
+                mrp_line = sale_order_line = None
+                mrp_ = self.env['operation.details'].create({'mrp_lines':mrp_lines,
+                                                             'sale_lines':sale_lines,
+                                                             'mrp_line':mrp_line,
+                                                             'sale_order_line':sal_line,
+                                                             'oa_id':p[0],
+                                                             'buyer_name':p_q[0].buyer_name,
+                                                             'product_template_id':p_q[0].product_template_id.id,
+                                                             'action_date':plan_start,
+                                                             'shade':p[1],
+                                                             'finish':p[2],
+                                                             'slidercodesfg':slider,
+                                                             'top':top,
+                                                             'bottom':bottom,
+                                                             'pinbox':pinbox,
+                                                             'operation_of':'output',
+                                                             'work_center':plan_for_id,
+                                                             'operation_by':'Planning',
+                                                             'based_on':material,
+                                                             'next_operation':next_operation,
+                                                             'qty':round(qty,2),
+                                                             'state':'waiting',
+                                                             'plan_id': max_plan_id,'mr_req': req_id
+                                                             })
+                
+    def button_requisition(self):
+        self._check_company()
+        action = self.env["ir.actions.actions"]._for_xml_id("taps_manufacturing.action_mrp_requisition")
+        action["domain"] = [('default_id','in',self.mapped('id'))]
+        return action
+
+    def button_set_expcd(self):
+        self._check_company()
+        action = self.env["ir.actions.actions"]._for_xml_id("taps_manufacturing.action_set_exp_cd")
+        action["domain"] = [('default_id','in',self.mapped('id'))]
+        return action
+
+    def button_output(self):
+        self.ensure_one()
+        self._check_company()
+        if self.state in ("done", "to_close", "cancel"):
+            raise UserError(
+                _(
+                    "Cannot split a manufacturing order that is in '%s' state.",
+                    self._fields["state"].convert_to_export(self.state, self),
+                )
+            )
+        action = self.env["ir.actions.actions"]._for_xml_id("mrp.action_split_mrp")
+        action["context"] = {"default_mo_id": self.id,"default_product_id": self.product_id}
+        return action
+
+
+    @api.model
+    def retrieve_production_data(self, start_date, end_date):
+        start_date = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date = datetime.strptime(end_date, "%Y-%m-%d")
+        domain_all = [
+            ('state', 'in', ['partial', 'done', 'closed']),
+            ('date_order', '>=', start_date),
+            ('date_order', '<=', end_date),
+        ]
+        # Fetching data using search_read
+        grouped_orders = self.search_read(
+            domain_all,
+            ['oa_id', 'product_uom_qty','done_qty', 'lead_time', 'st_lead_time', 'fg_categ_type', 'date_order','closing_date','company_id','price_unit']
+        )
+    
+        # Organize data by oa_id and fg_categ_type
+        aggregated = defaultdict(lambda: {
+            'oa_id': None,
+            'fg_categ_type': None,
+            'product_uom_qty_sum': 0,
+            'done_qty_sum': 0,
+            'weighted_lead_time_sum': 0,
+            'calculated_lead_time': 0,
+            'st_lead_time': None,
+            'date_order': None,
+            'closing_date':None,
+            'company_id': None,
+            'product_uom_qty_value': 0,
+            'done_qty_value': 0,
+            
+        })
+    
+        for order in grouped_orders:
+            # raise UserError((order['closing_date']))
+            oa_id = order['oa_id']
+            company_id = order['company_id']
+            if order['fg_categ_type']:
+                fg_categ_type = order['fg_categ_type']
+            key = (oa_id, fg_categ_type)
+    
+            if key not in aggregated:
+                # Set once-cast values for each oa_id and fg_categ_type
+                aggregated[key]['oa_id'] = oa_id
+                aggregated[key]['company_id'] = company_id
+                aggregated[key]['fg_categ_type'] = fg_categ_type
+                aggregated[key]['st_lead_time'] = order['st_lead_time']
+                aggregated[key]['date_order'] = order['date_order']
+                aggregated[key]['closing_date'] = order['closing_date']
+    
+            # Sum product_uom_qty
+            aggregated[key]['product_uom_qty_sum'] += order['product_uom_qty']
+            aggregated[key]['done_qty_sum'] += order['done_qty']
+            aggregated[key]['product_uom_qty_value'] += (order['product_uom_qty']*order['price_unit'])
+            aggregated[key]['done_qty_value'] += (order['done_qty']*order['price_unit'])
+    
+            # Add to weighted sum for lead_time calculation
+            if order['lead_time']:
+                aggregated[key]['weighted_lead_time_sum'] += order['product_uom_qty'] * order['lead_time']
+
+            if order['closing_date'] and order['date_order']:
+                closing_date = order['closing_date']
+                order_date = order['date_order']
+                lead_time_days = (closing_date - order_date).days
+                aggregated[key]['calculated_lead_time'] = lead_time_days
+                # raise UserError((order['closing_date']))
+    
+        # Prepare the final list
+        final_data = []
+        for data in aggregated.values():
+
+            total_qty = data['product_uom_qty_sum']
+            done_qty = data['done_qty_sum']
+            # weighted_avg_lead_time = (
+            #     (data['weighted_lead_time_sum'] / total_qty) if total_qty > 0 else 0
+            # )
+
+            lead_time_average = data['calculated_lead_time']
+
+            final_data.append({
+                'oa_id': data['oa_id'],
+                'fg_categ_type': data['fg_categ_type'],
+                'product_uom_qty_sum': total_qty,
+                'lead_time_average': lead_time_average,
+                'st_lead_time': data['st_lead_time'],
+                'date_order': data['date_order'],
+                'done_qty_sum' : done_qty,
+                'company_id' : data['company_id'],
+                'product_uom_qty_value': data['product_uom_qty_value'],
+                'done_qty_value': data['done_qty_value']
+            })
+    
+        # Sort the final data by oa_id, then by fg_categ_type
+        final_data = sorted(final_data, key=lambda x: (x['oa_id'], str(x['fg_categ_type'])))
+    
+        return self.generate_monthly_summary(final_data)
+        # return final_data
+    @api.model
+    def retrieve_average_production_data(self, start_date, end_date):
+        start_date = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date = datetime.strptime(end_date, "%Y-%m-%d")
+        domain_all = [
+            ('state', 'in', ['partial', 'done', 'closed']),
+            ('date_order', '>=', start_date),
+            ('date_order', '<=', end_date),
+        ]
+        # Fetching data using search_read
+        grouped_orders = self.search_read(
+            domain_all,
+            ['oa_id', 'product_uom_qty','done_qty', 'lead_time', 'st_lead_time', 'fg_categ_type', 'date_order','company_id','price_unit']
+        )
+    
+        # Organize data by oa_id and fg_categ_type
+        aggregated = defaultdict(lambda: {
+            'oa_id': None,
+            'fg_categ_type': None,
+            'product_uom_qty_sum': 0,
+            'done_qty_sum': 0,
+            'weighted_lead_time_sum': 0,
+            'st_lead_time': None,
+            'date_order': None,
+            'company_id': None,
+            'product_uom_qty_value': 0,
+            'done_qty_value': 0,
+            
+        })
+    
+        for order in grouped_orders:
+            oa_id = order['oa_id']
+            company_id = order['company_id']
+            if order['fg_categ_type']:
+                fg_categ_type = order['fg_categ_type']
+            key = (oa_id, fg_categ_type)
+    
+            if key not in aggregated:
+                # Set once-cast values for each oa_id and fg_categ_type
+                aggregated[key]['oa_id'] = oa_id
+                aggregated[key]['company_id'] = company_id
+                aggregated[key]['fg_categ_type'] = fg_categ_type
+                aggregated[key]['st_lead_time'] = order['st_lead_time']
+                aggregated[key]['date_order'] = order['date_order']
+    
+            # Sum product_uom_qty
+            aggregated[key]['product_uom_qty_sum'] += order['product_uom_qty']
+            aggregated[key]['done_qty_sum'] += order['done_qty']
+            aggregated[key]['product_uom_qty_value'] += (order['product_uom_qty']*order['price_unit'])
+            aggregated[key]['done_qty_value'] += (order['done_qty']*order['price_unit'])
+    
+            # Add to weighted sum for lead_time calculation
+            if order['lead_time']:
+                aggregated[key]['weighted_lead_time_sum'] += order['product_uom_qty'] * order['lead_time']
+    
+        # Prepare the final list
+        final_data = []
+        for data in aggregated.values():
+            # Calculate weighted average lead_time
+            total_qty = data['product_uom_qty_sum']
+            done_qty = data['done_qty_sum']
+            weighted_avg_lead_time = (
+                (data['weighted_lead_time_sum'] / total_qty) if total_qty > 0 else 0
+            )
+            final_data.append({
+                'oa_id': data['oa_id'],
+                'fg_categ_type': data['fg_categ_type'],
+                'product_uom_qty_sum': total_qty,
+                'lead_time_average': weighted_avg_lead_time,
+                'st_lead_time': data['st_lead_time'],
+                'date_order': data['date_order'],
+                'done_qty_sum' : done_qty,
+                'company_id' : data['company_id'],
+                'product_uom_qty_value': data['product_uom_qty_value'],
+                'done_qty_value': data['done_qty_value']
+            })
+    
+        # Sort the final data by oa_id, then by fg_categ_type
+        final_data = sorted(final_data, key=lambda x: (x['oa_id'], str(x['fg_categ_type'])))
+    
+        return self.generate_monthly_summary(final_data)
+
+
+    def generate_monthly_summary(self,final_data):
+    # Create a dictionary to group data by month and category
+        grouped_data = defaultdict(lambda: {
+            'month': None,
+            'fg_categ_type': None,
+            'st_lead_time_greater': 0,
+            'total_count': 0,
+            'company_id': None,
+            'st_lead_time_greater_value': 0,
+            'total_value': 0,
+            
+        })
+    
+        # Iterate over each record in final_data
+        for record in final_data:
+            # Extract the month from the `date_order` field
+            # date_obj = datetime.strptime(record['date_order'], "%Y-%m-%d")
+            month_key = record['date_order'].strftime("%Y-%m")  # Format as "YYYY-MM"
+            key = (month_key, record['fg_categ_type'])
+            
+            # Group by month and category
+            group = grouped_data[key]
+            group['month'] = month_key
+            group['fg_categ_type'] = record['fg_categ_type']
+            group['company_id'] = record['company_id']
+            group['total_count'] += 1
+            group['total_value'] += record['product_uom_qty_value']
+            
+            # Check if st_lead_time > lead_time
+            if record['st_lead_time'] > record['lead_time_average'] and record['product_uom_qty_sum']>= record['done_qty_sum']:
+                group['st_lead_time_greater'] += 1
+                group['st_lead_time_greater_value'] += record['done_qty_value']
+    
+        # Prepare the final summary data
+        summary_data = []
+        for group in grouped_data.values():
+            # Calculate the ratio
+            ratio = ((group['st_lead_time_greater'] / group['total_count'])*100) if group['total_count'] > 0 else 0
+            ratio_value = ((group['st_lead_time_greater_value'] / group['total_value'])*100) if group['total_value'] > 0 else 0
+            summary_data.append({
+                'month': group['month'],
+                'fg_categ_type': group['fg_categ_type'],
+                'st_lead_time_greater': group['st_lead_time_greater'],
+                'total_count': group['total_count'],
+                'st_lead_time_greater_value': group['st_lead_time_greater_value'],
+                'total_value': group['total_value'],
+                'ratio': ratio,
+                'ratio_value': ratio_value,
+                'company_id': group['company_id']
+            })
+    
+        # Sort summary_data by month and category
+        summary_data = sorted(
+            summary_data,
+            key=lambda x: (x.get('month', 'false'), x.get('fg_categ_type', 'Unknown'))
+        )
+        return summary_data
+
+
+    @api.model
+    def retrieve_production_data_month_wise(self, start_date, end_date):
+        start_date = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date = datetime.strptime(end_date, "%Y-%m-%d")
+    
+        domain_all = [
+            ('state', 'in', ['partial', 'done', 'closed']),
+            ('date_order', '>=', start_date),
+            ('date_order', '<=', end_date),
+        ]
+    
+        grouped_orders = self.search_read(
+            domain_all,
+            ['oa_id', 'product_uom_qty', 'done_qty', 'lead_time', 'st_lead_time',
+             'date_order', 'company_id', 'price_unit']
+        )
+    
+        # Dictionary to store aggregated results per `oa_id`
+        aggregated = {}
+    
+        for record in grouped_orders:
+            oa_id = record.get('oa_id', False)
+            company_id = record.get('company_id', False)
+            if not oa_id:
+                continue
+            
+            if oa_id not in aggregated:
+                aggregated[oa_id] = {
+                    'oa_id': oa_id,
+                    'product_uom_qty_sum': 0,
+                    'done_qty_sum': 0,
+                    'product_uom_qty_value_sum': 0,
+                    'done_qty_value_sum': 0,
+                    'weighted_lead_time_numerator': 0,  # ∑ (product_uom_qty * lead_time)
+                    'weighted_lead_time_denominator': 0, # ∑ product_uom_qty
+                    'st_lead_time': record.get('st_lead_time'),
+                    'date_order': record.get('date_order'),
+                    'company_id': company_id,  # Company ID now stored for each OA ID
+                }
+            
+            # Aggregate numeric fields
+            product_uom_qty = record.get('product_uom_qty', 0) or 0
+            done_qty = record.get('done_qty', 0) or 0
+            price_unit = record.get('price_unit', 0) or 0
+            lead_time = record.get('lead_time', 0) or 0
+    
+            aggregated[oa_id]['product_uom_qty_sum'] += product_uom_qty
+            aggregated[oa_id]['done_qty_sum'] += done_qty
+            aggregated[oa_id]['product_uom_qty_value_sum'] += product_uom_qty * price_unit
+            aggregated[oa_id]['done_qty_value_sum'] += done_qty * price_unit
+            aggregated[oa_id]['weighted_lead_time_numerator'] += done_qty * lead_time
+            aggregated[oa_id]['weighted_lead_time_denominator'] += product_uom_qty
+    
+        # Compute weighted lead_time
+        for oa_id, data in aggregated.items():
+            if data['weighted_lead_time_denominator'] > 0:
+                data['lead_time'] = data['weighted_lead_time_numerator'] / data['weighted_lead_time_denominator']
+            else:
+                data['lead_time'] = 0  # Avoid division by zero
+    
+            # Remove temporary computation fields
+            del data['weighted_lead_time_numerator']
+            del data['weighted_lead_time_denominator']
+    
+        # Convert dict values to list
+        aggregated_list = list(aggregated.values())
+    
+        # Compute month-wise ratio
+        month_data = defaultdict(lambda: defaultdict(lambda: {'count_total': 0, 'count_below_threshold': 0, 'value_total': 0 ,'value_below_threshold':0}))
+    
+        for entry in aggregated_list:
+            if not entry['st_lead_time'] or not entry['lead_time']:
+                continue
+            
+            st_lead_time = entry['st_lead_time']
+            lead_time = entry['lead_time']
+            company_id = entry['company_id']
+    
+            # Extract month-year from `st_lead_time`
+            month_year = entry['date_order'].strftime("%b-%y")
+    
+            month_data[month_year][company_id]['count_total'] += 1
+            month_data[month_year][company_id]['value_total'] += entry['product_uom_qty_value_sum']
+    
+            if st_lead_time > lead_time and (entry['done_qty_sum'] >= entry['product_uom_qty_sum']):
+                month_data[month_year][company_id]['count_below_threshold'] += 1
+                month_data[month_year][company_id]['value_below_threshold'] += entry['done_qty_value_sum']
+    
+        # Calculate ratios for each month per company
+        month_ratios = []
+        for month, companies in month_data.items():
+            for company_id, data in companies.items():
+                ratio = ((data['count_below_threshold'] / data['count_total'])*100) if data['count_total'] > 0 else 0
+                ratio_value = ((data['value_below_threshold'] / data['value_total'])*100) if data['value_total'] > 0 else 0
+                month_ratios.append({
+                    'month': month,
+                    'company_id': company_id,
+                    'ratio': round(ratio, 2),  # Keep two decimal places
+                    'ratio_value': round(ratio_value, 2)  # Keep two decimal places
+                })
+    
+        return {'month_wise_ratios': month_ratios}
+
+    @api.model
+    def retrieve_otif_reminder_data(self):
+       
+        domain_all = [
+            ('state', 'in', ['partial', 'done'])
+        ]
+    
+        grouped_orders = self.search_read(
+            domain_all,
+            ['oa_id', 'fg_categ_type','product_uom_qty', 'done_qty', 'lead_time', 'st_lead_time',
+             'date_order', 'company_id', 'price_unit']
+        )
+    
+        return grouped_orders
+        
+    
+    # def button_createlot(self):
+    #     self.ensure_one()
+    #     self._check_company()
+    #     if self.state in ("done", "to_close", "cancel"):
+    #         raise UserError(
+    #             _(
+    #                 "Cannot split a manufacturing order that is in '%s' state.",
+    #                 self._fields["state"].convert_to_export(self.state, self),
+    #             )
+    #         )
+    #     action = self.env["ir.actions.actions"]._for_xml_id("mrp.action_split_mrp")
+    #     action["context"] = {"default_mo_id": self.id,"default_product_id": self.product_id}
+    #     return action
+
+    @api.model
+    def read_group(self, domain, fields, groupby, offset=0, limit=None, orderby=False, lazy=True):
+        """Custom weighted average calculation."""
+        result = super(ManufacturingOrder, self).read_group(domain, fields, groupby, offset, limit, orderby, lazy)
+        for res in result:
+            records = self.search(res['__domain']) 
+            total_weight = sum(records.mapped('done_qty'))  # Total weight (done_qty)
+            total_value = sum(r.done_qty * (r.lead_time or 0) for r in records)  # Handle None values
+            res['lead_time'] = total_value / total_weight if total_weight else 0  # Weighted average formul
+        return result
+
+  
+
+        
+        
+
+
+    
+
+
+    
+    
