@@ -1,4 +1,4 @@
-from django.urls import path, include
+from django.urls import path
 from . import views
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
@@ -6,8 +6,22 @@ from rest_framework_simplejwt.views import (
 )
 from django.contrib.auth import views as auth_views
 from paymentGateway import views as paymentviews
+from drf_yasg.views import get_schema_view
+from drf_yasg import openapi
+from rest_framework import permissions
+
+schema_view = get_schema_view(
+    openapi.Info(
+        title="Payment Gateway Integration and Files Uploading System",
+        default_version='v1',
+        description="API Documentation",
+    ),
+    public=True,
+    permission_classes=(permissions.AllowAny,),
+)
 
 urlpatterns = [
+    path('swagger/', schema_view.with_ui('swagger', cache_timeout=0)),
     path('register/', views.RegisterAPI.as_view(), name='register'),
     path("login/", TokenObtainPairView.as_view(), name='login'),
     path('refresh/', TokenRefreshView.as_view(), name='token_refresh'),

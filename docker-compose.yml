@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    command: >
+      bash -c "python manage.py migrate && 
+      exec python manage.py runserver 0.0.0.0:8000"
+    container_name: aamarpay-web
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    env_file: 
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - aamarpay-network
+
+  db:
+    image: mysql:8.0
+    container_name: aamarpay-db
+    environment:
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u${MYSQL_USER}", "-p${MYSQL_PASSWORD}"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - aamarpay-network
+
+  redis:
+    image: redis:alpine
+    container_name: aamarpay-redis
+    ports:
+      - "6378:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - aamarpay-network
+
+  celery:
+    build: .
+    command: >
+      bash -c "sleep 15 && celery -A aamarPay worker --loglevel=info"
+    container_name: aamarpay-celery
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - aamarpay-network
+
+volumes:
+  mysql_data:
+
+networks:
+  aamarpay-network:
+    driver: bridge
