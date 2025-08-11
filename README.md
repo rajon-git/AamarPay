@@ -85,3 +85,14 @@ How To Run:
         8. sudo docker-compose run web bash / sudo docker exec -it (there give aamarpay-web container ID) bash.
         9. Create an superuser 
         10. Done
+
+
+Here the .env File :
+
+        AAMARPAY_STORE_ID = "aamarpaytest"
+        AAMARPAY_SIGNATURE_KEY = "dbb74894e82415a2f7ff0ec3a97e4183"
+        AAMARPAY_ENDPOINT = "https://sandbox.aamarpay.com/jsonpost.php"
+
+        MYSQL_DATABASE = 'mydatabase' 
+        MYSQL_USER = 'aamarPay' 
+        MYSQL_PASSWORD = 'AamarPay@1234'
